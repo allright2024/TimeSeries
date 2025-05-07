@@ -52,9 +52,9 @@ def data_provider(args, flag):
             target=args.target,
             timeenc=timeenc,
             freq=freq,
-            percent=percent,
             seasonal_patterns=args.seasonal_patterns
         )
+        
     data_loader = DataLoader(
         data_set,
         batch_size=batch_size,
