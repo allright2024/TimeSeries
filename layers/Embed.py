@@ -158,7 +158,7 @@ class ReplicationPad1d(nn.Module):
 
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, d_model, patch_len, stride, dropout):
+    def __init__(self, d_model, patch_len, stride, dropout, variants, seq_len):
         super(PatchEmbedding, self).__init__()
         # Patching
         self.patch_len = patch_len
@@ -167,23 +167,179 @@ class PatchEmbedding(nn.Module):
 
         # Backbone, Input encoding: projection of feature vectors onto a d-dim vector space
         self.value_embedding = TokenEmbedding(patch_len, d_model)
+        self.variants = variants
 
         # Positional embedding
         # self.position_embedding = PositionalEmbedding(d_model)
 
+        num_patches = (seq_len + stride - patch_len) // stride + 1
+        self.patch_position_embedding_layer = nn.Embedding(num_embeddings=num_patches, embedding_dim=d_model) 
+
+        self.original_patch_indices = torch.arange(num_patches)
+        self.flat_patch_indices = torch.repeat_interleave(self.original_patch_indices, repeats=variants)
+        
+
+        
         # Residual dropout
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # do patching
+        print(x.shape)
+        
         n_vars = x.shape[1]
+        
+        # Patching
         x = self.padding_patch_layer(x)
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
+        x = x.permute(0, 2, 1, 3)
+        
+        x = torch.reshape(x, (x.shape[0], x.shape[2] * x.shape[1], x.shape[3]))
+        
         # Input encoding
         x = self.value_embedding(x)
-        return self.dropout(x), n_vars
+        
+        pos_embed = self.patch_position_embedding_layer(self.flat_patch_indices.to(x.device))
+        pos_embed = pos_embed.unsqueeze(0).expand(x.shape[0], -1, -1)
 
+        x = x + pos_embed
+        
+        return self.dropout(x), n_vars
+    
+# class VariantAwarePatchEmbedding(nn.Module):
+#     def __init__(self, d_model, patch_len, stride, dropout, variants, seq_len):
+#         super(VariantAwarePatchEmbedding, self).__init__()
+        
+#         self.patch_len = patch_len
+#         self.stride = stride
+#         self.variants = variants
+        
+#         self.padding_patch_layer = ReplicationPad1d((0, stride))
+
+#         # variant별 embedding
+#         self.variant_embeddings = nn.ModuleList([
+#             nn.Linear(patch_len, d_model) for _ in range(variants)
+#         ])
+
+#         # Position embedding
+#         self.num_patches = (seq_len + stride - patch_len) // stride + 1
+#         self.pos_embedding = nn.Embedding(self.num_patches, d_model)
+
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, x):
+#         # x: [batch, variants, seq_len]
+#         B, V, seq_len = x.shape
+
+#         # 패딩 적용
+#         x = self.padding_patch_layer(x)  # [B, V, seq_len + padding]
+
+#         # 패치 생성: [B, V, num_patches, patch_len]
+#         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+#         num_patches = x.shape[2]
+
+#         variant_emb_list = []
+#         for v in range(self.variants):
+#             variant_data = x[:, v, :, :]  # [B, num_patches, patch_len]
+#             emb = self.variant_embeddings[v](variant_data)  # [B, num_patches, d_model]
+#             variant_emb_list.append(emb.unsqueeze(2))  # [B, num_patches, 1, d_model]
+
+#         # variant 축 결합 [B, num_patches, variants, d_model]
+#         variant_emb = torch.cat(variant_emb_list, dim=2)
+
+#         # variant 축 평균 aggregation → [B, num_patches, d_model]
+#         patch_emb = variant_emb.mean(dim=2)
+
+#         # Position embedding 추가
+#         pos_idx = torch.arange(num_patches, device=x.device).unsqueeze(0).expand(B, -1)
+#         pos_emb = self.pos_embedding(pos_idx)
+
+#         patch_emb = patch_emb + pos_emb
+
+#         return self.dropout(patch_emb), V
+
+class VariantAwarePatchEmbedding(nn.Module):
+    """
+    VariantAwarePatchEmbedding
+    --------------------------
+    1. ReplicationPad1d: stride만큼 시계열 끝부분을 복제-pad
+    2. unfold: patch_len 크기로 슬라이딩(간격 stride) → [B, V, P, patch_len]
+       - P = (seq_len + stride - patch_len)//stride + 1
+    3. variant별 Linear (patch_len → d_model)
+    4. variant축 평균(aggregation) → [B, P, d_model]
+    5. positional embedding (embedding table 크기는 num_patches)
+    6. Dropout 후 반환
+
+    Args:
+    - d_model   : 임베딩 차원
+    - patch_len : 한 패치 길이
+    - stride    : 슬라이딩 간격
+    - dropout   : 드롭아웃 비율
+    - variants  : 변수(variant) 개수
+    - seq_len   : 전체 시계열 길이 (패치 개수 계산용)
+
+    Input shape:
+    - x: [B, V, seq_len]
+
+    Output:
+    - patch_emb: [B, P, d_model] (P = num_patches)
+    - V: int (입력 variants 수)
+    """
+
+    def __init__(self, d_model, patch_len, stride, dropout, variants, seq_len):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.variants = variants
+
+        #    여기서는 seq_len 마지막에 stride만큼 복제 패딩을 하므로 (0, stride)
+        self.replication_pad = nn.ReplicationPad1d((0, stride))
+
+        self.variant_embeddings = nn.ModuleList([
+            nn.Linear(patch_len, d_model) for _ in range(variants)
+        ])
+
+        #    num_patches = (seq_len + stride - patch_len)//stride + 1
+        self.num_patches = (seq_len + stride - patch_len) // stride + 1
+
+        self.pos_embedding = nn.Embedding(self.num_patches, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        x: [B, V, seq_len]
+        returns:
+          patch_emb: [B, P, d_model]
+          V        : (int) 입력 variant 수
+        """
+        B, V, seq_len = x.shape
+
+        x_padded = self.replication_pad(x)
+
+        x_unfold = x_padded.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # x_unfold.shape == [B, V, num_patches, patch_len]
+        num_patches = x_unfold.size(2)
+
+        variant_embs = []
+        for v_idx in range(V):
+            patch_data = x_unfold[:, v_idx, :, :]
+
+            v_emb = self.variant_embeddings[v_idx](patch_data)
+
+            variant_embs.append(v_emb.unsqueeze(2))
+
+        variant_emb_all = torch.cat(variant_embs, dim=2)
+
+        patch_emb = variant_emb_all.mean(dim=2)
+
+        pos_idx = torch.arange(num_patches, device=x.device).unsqueeze(0).expand(B, -1)  # [B, P]
+        pos_emb = self.pos_embedding(pos_idx)  # [B, P, d_model]
+        patch_emb = patch_emb + pos_emb
+
+        patch_emb = self.dropout(patch_emb)
+
+        return patch_emb, V
 
 class DataEmbedding_wo_time(nn.Module):
     def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
