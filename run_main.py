@@ -51,6 +51,7 @@ parser.add_argument('--freq', type=str, default='h',
                          'options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], '
                          'you can also use more detailed freq like 15min or 3h')
 parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
+parser.add_argument("--variants", type=int, default=7, help="how many variants in your datasets?")
 
 # forecasting task
 parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
@@ -77,9 +78,12 @@ parser.add_argument('--output_attention', action='store_true', help='whether to 
 parser.add_argument('--patch_len', type=int, default=16, help='patch length')
 parser.add_argument('--stride', type=int, default=8, help='stride')
 parser.add_argument('--prompt_domain', type=int, default=0, help='')
-parser.add_argument('--llm_model', type=str, default='LLAMA', help='LLM model') # LLAMA, GPT2, BERT
-parser.add_argument('--llm_dim', type=int, default='4096', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
-
+parser.add_argument('--llm_model', type=str, default='GPT2', help='LLM model') # LLAMA, GPT2, BERT
+parser.add_argument('--llm_dim', type=int, default='768', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
+parser.add_argument('--down_sampling_layers', type=int, default=0, help='num of down sampling layers')
+parser.add_argument('--down_sampling_window', type=int, default=1, help='down sampling window size')
+parser.add_argument('--down_sampling_method', type=str, default='avg',
+                    help='down sampling method, only support avg, max, conv')
 
 # optimization
 parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
@@ -127,12 +131,14 @@ for ii in range(args.itr):
     vali_data, vali_loader = data_provider(args, 'val')
     test_data, test_loader = data_provider(args, 'test')
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     if args.model == 'Autoformer':
         model = Autoformer.Model(args).float()
     elif args.model == 'DLinear':
         model = DLinear.Model(args).float()
     else:
-        model = TimeLLM.Model(args).float()
+        model = TimeLLM.Model(args).to(device, dtype=torch.bfloat16)
 
     path = os.path.join(args.checkpoints,
                         setting + '-' + args.model_comment)  # unique checkpoint saving path
@@ -164,8 +170,8 @@ for ii in range(args.itr):
     criterion = nn.MSELoss()
     mae_metric = nn.L1Loss()
 
-    train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
-        train_loader, vali_loader, test_loader, model, model_optim, scheduler)
+    # train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
+    #     train_loader, vali_loader, test_loader, model, model_optim, scheduler)
 
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
@@ -180,15 +186,16 @@ for ii in range(args.itr):
             iter_count += 1
             model_optim.zero_grad()
 
-            batch_x = batch_x.float().to(accelerator.device)
-            batch_y = batch_y.float().to(accelerator.device)
-            batch_x_mark = batch_x_mark.float().to(accelerator.device)
-            batch_y_mark = batch_y_mark.float().to(accelerator.device)
+            
+            batch_x = batch_x.to(accelerator.device)
+            batch_y = batch_y.to(accelerator.device)
+            batch_x_mark = batch_x_mark.to(accelerator.device)
+            batch_y_mark = batch_y_mark.to(accelerator.device)
 
             # decoder input
-            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).to(
                 accelerator.device)
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).to(
                 accelerator.device)
 
             # encoder - decoder
