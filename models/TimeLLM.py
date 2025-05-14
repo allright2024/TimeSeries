@@ -83,7 +83,6 @@ class MultiTrendResidualVariantTemporalFusion(nn.Module):
         super().__init__()
         self.trend1_fusion = VariantTemporalFusion(variants, d_model, heads)
         self.trend2_fusion = VariantTemporalFusion(variants, d_model, heads)
-        self.trend3_fusion = VariantTemporalFusion(variants, d_model, heads)
         self.res3_fusion   = VariantTemporalFusion(variants, d_model, heads)
 
         self.cross_trend  = nn.MultiheadAttention(d_model, heads, batch_first=True)
@@ -95,19 +94,18 @@ class MultiTrendResidualVariantTemporalFusion(nn.Module):
             nn.ReLU(),
             nn.Linear(d_model, d_model)
         )
-
-    def forward(self, t1, t2, t3, r3):          # 모두 [B, T, V]
+    @torch.cuda.amp.autocast(dtype=torch.bfloat16)
+    def forward(self, t1, t2, r3):          # 모두 [B, T, V]
         t1 = self.trend1_fusion(t1)             # [B, T, D]
         t2 = self.trend2_fusion(t2)
-        t3 = self.trend3_fusion(t3)
         r3 = self.res3_fusion(r3)
 
-        # ---- Trend cross-attention (t1 ← {t2,t3}) --------------
-        kv  = torch.cat([t2, t3], dim=1)        # [B, 2T, D]
-        t_fused, _ = self.cross_trend(t1, kv, kv)
+        # ---- Trend cross-attention (t1 ← t2) --------------
+        kv = t2       # [B, 2T, D]
+        t_fused = self.cross_trend(t1, kv, kv)[0]
         t_fused = self.norm1(t1 + t_fused)
 
-        kv2, _ = self.cross_final(t_fused, r3, r3)
+        kv2 = self.cross_final(t_fused, r3, r3)[0]
         out = self.norm2(t_fused + kv2)
 
         return self.fc(out)                     # [B, T, D]
@@ -157,50 +155,6 @@ class VariantAwareFusion(nn.Module):
         
         return fused_output
     
-class MultiTrendResidualVariantFusion(nn.Module):
-    def __init__(self, variants, llm_dim, num_heads=4):
-        super(MultiTrendResidualVariantFusion, self).__init__()
-        
-        self.variants = variants
-        self.llm_dim = llm_dim
-
-        self.trend1_fusion = VariantAwareFusion(variants, llm_dim, num_heads)
-        self.trend2_fusion = VariantAwareFusion(variants, llm_dim, num_heads)
-        self.trend3_fusion = VariantAwareFusion(variants, llm_dim, num_heads)
-        self.residual3_fusion = VariantAwareFusion(variants, llm_dim, num_heads)
-
-        self.trend_attention = nn.MultiheadAttention(llm_dim, num_heads, batch_first=True)
-        self.norm_trend = nn.LayerNorm(llm_dim)
-
-        self.final_attention = nn.MultiheadAttention(llm_dim, num_heads, batch_first=True)
-        self.norm_final = nn.LayerNorm(llm_dim)
-
-        self.fc = nn.Sequential(
-            nn.Linear(llm_dim, llm_dim),
-            nn.ReLU(),
-            nn.Linear(llm_dim, llm_dim)
-        )
-
-    def forward(self, trend1, trend2, trend3, residual3):
-        trend1_emb = self.trend1_fusion(trend1)      # [B, T, llm_dim]
-        trend2_emb = self.trend2_fusion(trend2)
-        trend3_emb = self.trend3_fusion(trend3)
-        residual3_emb = self.residual3_fusion(residual3)
-
-        trend_kv = torch.cat([trend2_emb, trend3_emb], dim=1)  # [B, 2*T, llm_dim]
-        trend_fused, _ = self.trend_attention(query=trend1_emb, key=trend_kv, value=trend_kv)
-
-        trend_fused = self.norm_trend(trend1_emb + trend_fused)
-
-        final_kv = torch.cat([trend_fused, residual3_emb], dim=1)  # [B, 2*T, llm_dim]
-        final_fused, _ = self.final_attention(query=trend_fused, key=final_kv, value=final_kv)
-
-        final_fused = self.norm_final(trend_fused + final_fused)
-
-        output = self.fc(final_fused)
-
-        return output
-
 class FusionBlock(nn.Module):
     def __init__(self, d_model, n_heads):
         """
@@ -243,44 +197,54 @@ class FusionBlock(nn.Module):
     
     
 class CrossAttentionReducer(nn.Module):
-    def __init__(self, llm_dim, vocab_num, heads=8):
+    def __init__(self,
+                 llm_dim: int,
+                 vocab_num: int,
+                 heads: int = 8,
+                 proj_dim: int | None = None):        # ⬅️ 줄이고 싶은 크기를 직접 넘길 수도
         super().__init__()
         self.heads = heads
-        self.llm_dim = llm_dim
-        self.vocab_num = vocab_num
-        self.head_dim = llm_dim // heads
+
+        # ───── 작은 투사 차원 설정 ─────
+        self.inner_dim = proj_dim if proj_dim is not None else llm_dim // 6
+        assert self.inner_dim % heads == 0, "inner_dim must be divisible by heads"
+        self.head_dim = self.inner_dim // heads
         self.scale = self.head_dim ** -0.5
-        
-        self.learned_queries = nn.Parameter(torch.randn(vocab_num, llm_dim))
-        
-        self.q_proj = nn.Linear(llm_dim, llm_dim)
-        self.k_proj = nn.Linear(llm_dim, llm_dim)
-        self.v_proj = nn.Linear(llm_dim, llm_dim)
-        
-        self.out_proj = nn.Linear(llm_dim, llm_dim)
-        
-    def forward(self, token_input):
-        T = token_input.shape[0]
-        H = self.heads
-        D = self.head_dim
-        
-        q = self.q_proj(self.learned_queries) # [vocab_num, llm_dim]
-        k = self.k_proj(token_input) # [token_num, llm_dim]
-        v = self.v_proj(token_input) # [token_num, llm_dim]
-        
-        q = q.reshape(self.vocab_num, H, D).transpose(0, 1) # [H, vocab_num, D]
-        k = k.reshape(T, H, D).transpose(0, 1) # [H, token_num, D]
-        v = v.reshape(T, H, D).transpose(0, 1) # [H, token_num, D]
-        
-        
-        
-        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        
-        out = attn_probs @ v
-        out = out.transpose(0, 1).reshape(self.vocab_num, self.llm_dim)
-        
-        return self.out_proj(out)
+        # ──────────────────────────────
+
+        self.vocab_num = vocab_num
+
+        # 학습 쿼리(크기는 inner_dim)
+        self.learned_queries = nn.Parameter(torch.randn(vocab_num, self.inner_dim))
+
+        # Q, K, V 투사: 입력 llm_dim → inner_dim
+        self.q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(llm_dim,      self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(llm_dim,      self.inner_dim, bias=False)
+
+        # out_proj: inner_dim → llm_dim
+        self.out_proj = nn.Linear(self.inner_dim, llm_dim, bias=False)
+
+    def forward(self, token_input):          # token_input: [T, llm_dim]
+        T, H, D = token_input.size(0), self.heads, self.head_dim
+
+        q = self.q_proj(self.learned_queries)          # [vocab, inner_dim]
+        k = self.k_proj(token_input)                   # [T,     inner_dim]
+        v = self.v_proj(token_input)                   # [T,     inner_dim]
+
+        # H-way 분할
+        q = q.reshape(self.vocab_num, H, D).transpose(0, 1)   # [H, vocab, D]
+        k = k.reshape(T,              H, D).transpose(0, 1)   # [H, T,     D]
+        v = v.reshape(T,              H, D).transpose(0, 1)   # [H, T,     D]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale         # [H, vocab, T]
+        attn = F.softmax(attn, dim=-1)
+
+        out = attn @ v                                        # [H, vocab, D]
+        out = out.transpose(0, 1).reshape(self.vocab_num, self.inner_dim)
+
+        return self.out_proj(out)                             # [vocab, llm_dim]
+
         
         
 
@@ -489,7 +453,10 @@ class Model(nn.Module):
         else:
             raise NotImplementedError
 
-        self.normalize_layers = Normalize(configs.enc_in, affine=False)
+        self.normalize_layers1 = Normalize(configs.enc_in, affine=False)
+        self.normalize_layers2 = Normalize(configs.enc_in, affine=False)
+        self.normalize_layers3 = Normalize(configs.enc_in, affine=False)
+        self.normalize_layers4 = Normalize(configs.enc_in, affine=False)
         
         
     def __multi_scale_process_inputs(self, x_enc, x_mark_enc):
@@ -549,22 +516,22 @@ class Model(nn.Module):
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         res, mean = self.pre_enc(x_enc) # x_enc_decomp[0] : res, x_enc_decomp[1] : moving_mean
         res_res, res_mean = self.pre_enc(res) # x_enc_decomp_2[0] : res_res, x_enc_decomp_2[1] : res_moving_mean
-        res_res_res, res_res_mean = self.pre_enc(res_res)
+        # res_res_res, res_res_mean = self.pre_enc(res_res)
         
         source_embeddings = self.mapping_layer(self.word_embeddings)
         
-        x_enc = self.normalize_layers(x_enc, 'norm')
+        x_enc = self.normalize_layers1(x_enc, 'norm')
         
-        mean = self.normalize_layers(mean, 'norm')
-        res_res_res = self.normalize_layers(res_res_res, 'norm')
-        res_res_mean = self.normalize_layers(res_res_mean, 'norm')
-        res_mean = self.normalize_layers(res_mean, 'norm')
+        mean = self.normalize_layers2(mean, 'norm')
+        res_res = self.normalize_layers4(res_res, 'norm')
+        # res_res_mean = self.normalize_layers(res_res_mean, 'norm')
+        res_mean = self.normalize_layers3(res_mean, 'norm')
         
-        fusion_output = self.variants_temporal_fusion(mean, res_mean, res_res_mean, res_res_res)
+        fusion_output = self.variants_temporal_fusion(mean, res_mean, res_res)
                 
         
-        print(fusion_output.shape)
-        print(source_embeddings.shape)
+        # print(fusion_output.shape)
+        # print(source_embeddings.shape)
                 
         reprogrammed_fusion_output = self.reprogramming_layer(fusion_output, source_embeddings, source_embeddings)
         
@@ -610,19 +577,12 @@ class Model(nn.Module):
         
         x_enc = x_enc.permute(0, 2, 1).contiguous()
         
-        print("x_enc", x_enc.shape)
         
         enc_out, n_vars = self.variant_patch_embedding(x_enc.to(torch.bfloat16))
         
-        print("enc_out", enc_out.shape)
         
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         
-        print("enc_out", enc_out.shape)
-        
-        print(prompt_embeddings.shape)
-        print(reprogrammed_fusion_output.shape)
-        print(enc_out.shape)
         
         llama_enc_out = torch.cat([
             prompt_embeddings, 
@@ -641,7 +601,7 @@ class Model(nn.Module):
 
         dec_patch = self.output_projection(dec_patch)         
         dec_out  = dec_patch.permute(0, 2, 1).contiguous()     
-        dec_out  = self.normalize_layers(dec_out, 'denorm')
+        dec_out  = self.normalize_layers1(dec_out, 'denorm')
 
         return dec_out
 
@@ -659,82 +619,37 @@ class ReprogrammingLayer(nn.Module):
         super(ReprogrammingLayer, self).__init__()
 
         d_keys = d_keys or (d_model // n_heads)
+
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_llm, d_keys * n_heads)
+        self.value_projection = nn.Linear(d_llm, d_keys * n_heads)
+        self.out_projection = nn.Linear(d_keys * n_heads, d_llm)
         self.n_heads = n_heads
-        self.d_model = d_model
-        self.d_llm   = d_llm
+        self.dropout = nn.Dropout(attention_dropout)
 
-        self.query_projection = nn.Linear(d_model,  d_keys * n_heads)
-        self.key_projection   = nn.Linear(d_llm,    d_keys * n_heads)
-        self.value_projection = nn.Linear(d_llm,    d_keys * n_heads)
-        self.out_projection   = nn.Linear(d_keys * n_heads, d_llm)
-
-        self.dropout_attn = nn.Dropout(attention_dropout)
-
-        # self.norm_attn = nn.LayerNorm(d_model)
-
-        # self.ffn = nn.Sequential(
-        #     nn.Linear(d_model, d_llm)
-        # )
-
-    def forward(self, target_embedding, source_key, source_value):
-        """
-        target_embedding: [B, L, d_model]
-        source_key:       [S, d_llm] (no batch dim)
-        source_value:     [S, d_llm]
-        """
+    def forward(self, target_embedding, source_embedding, value_embedding):
         B, L, _ = target_embedding.shape
-        S, _    = source_key.shape
-        H       = self.n_heads
+        S, _ = source_embedding.shape
+        H = self.n_heads
 
-        # 1) Linear Projection
-        Q = self.query_projection(target_embedding) # [B, L, H*d_k]
-        K = self.key_projection(source_key)         # [S,   H*d_k]
-        V = self.value_projection(source_value)     # [S,   H*d_k]
+        target_embedding = self.query_projection(target_embedding).view(B, L, H, -1)
+        source_embedding = self.key_projection(source_embedding).view(S, H, -1)
+        value_embedding = self.value_projection(value_embedding).view(S, H, -1)
 
-        Q = Q.contiguous().view(B, L, H, -1)  # [B, L, H, d_k]
-        K = K.contiguous().view(S, H, -1)     # [S, H, d_k]
-        V = V.contiguous().view(S, H, -1)     # [S, H, d_k]
+        out = self.reprogramming(target_embedding, source_embedding, value_embedding)
 
-        # 2) Cross-attention
-        out = self.cross_attention(Q, K, V)   # [B, L, H, d_k]
-        out = out.contiguous().view(B, L, -1)             # [B, L, H*d_k = d_model]
-        out = self.out_projection(out)       # [B, L, d_model]
+        out = out.reshape(B, L, -1)
 
-        # # 3) Residual & Norm
-        # out = self.norm_attn(target_embedding + out)
+        return self.out_projection(out)
 
-        # # 4) (옵션) FeedForward
-        # ffn_out = self.ffn(out)            # [B, L, d_llm]
+    def reprogramming(self, target_embedding, source_embedding, value_embedding):
+        B, L, H, E = target_embedding.shape
 
-        return out
+        scale = 1. / sqrt(E)
 
-    def cross_attention(self, Q, K, V):
-        """
-        Q: [B, L, H, d_k]
-        K: [S, H, d_k]
-        V: [S, H, d_k]
-        Return: [B, L, H, d_k]
-        """
-        B, L, H, d_k = Q.shape
-        S           = K.shape[0]
-        scale       = 1. / sqrt(d_k)
+        scores = torch.einsum("blhe,she->bhls", target_embedding, source_embedding)
 
-        scores = torch.einsum("blhd,shd->bhl s d", Q, K)  
+        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        reprogramming_embedding = torch.einsum("bhls,she->blhe", A, value_embedding)
 
-        Q_ = Q.permute(0,2,1,3).reshape(B*H, L, d_k)  # [BH, L, d_k]
-        K_ = K.permute(1,0,2).reshape(H, S, d_k)      # [H, S, d_k]
-        # ?
-        K_ = K_.expand(B, -1, -1, -1).reshape(B*H, S, d_k)  # [BH, S, d_k]
-
-        scores = torch.bmm(Q_, K_.transpose(1,2)) * scale  # [BH, L, S]
-
-        attn_weights = F.softmax(scores, dim=-1)           # [BH, L, S]
-        attn_weights = self.dropout_attn(attn_weights)
-
-        V_ = V.permute(1,0,2).unsqueeze(0).expand(B, -1, -1, -1) # [B, H, S, d_k]
-        V_ = V_.reshape(B*H, S, d_k)                              # [BH, S, d_k]
-
-        out = torch.bmm(attn_weights, V_)  # [BH, L, d_k]
-
-        out = out.view(B, H, L, d_k).permute(0,2,1,3)  # [B, L, H, d_k]
-        return out
+        return reprogramming_embedding
